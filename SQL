@@ -1,35 +1,56 @@
+-- PostgreSQL Performance Assignment
+-- Generate 2 million orders, analyze a slow query,
+-- add a targeted index, test isolation levels,
+-- and document PgBouncer transaction pooling.
+
 -- Step 1: Generate a Big Table
--- Step 1: Generate a Big Table (2 Million Rows)
 CREATE TABLE orders (
-id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-customer_id INT,
-@@ -17,7 +17,7 @@ FROM generate_series(1, 2000000);
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id INT,
+    amount NUMERIC(10,2),
+    status TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+INSERT INTO orders (customer_id, amount, status, created_at)
+SELECT
+    (random() * 50000)::int,
+    (random() * 500)::numeric(10,2),
+    (ARRAY['pending', 'shipped', 'delivered'])[ceil(random() * 3)],
+    now() - (random() * 365)::int * interval '1 day'
+FROM generate_series(1, 2000000);
 
 ANALYZE orders;
 
+
 -- Step 2: Measure the Slow Query
--- Step 2: Measure the Slow Query (Before Index)
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT customer_id, SUM(amount)
 FROM orders
-@@ -27,6 +27,12 @@ GROUP BY customer_id
+WHERE status = 'pending'
+  AND created_at > now() - interval '30 days'
+GROUP BY customer_id
 ORDER BY SUM(amount) DESC
 LIMIT 10;
 
-/*
--- OBSERVATION BEFORE INDEX:
--- The execution plan uses a Sequential Scan across the entire 2-million-row table.
--- Execution Time is high because it has to check every single row and filter them in memory/disk.
-*/
 
 -- Step 3: Add a Targeted Index and Re-Measure
 CREATE INDEX idx_pending_recent
 ON orders (created_at DESC, customer_id)
-@@ -42,18 +48,23 @@ GROUP BY customer_id
+WHERE status = 'pending';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT customer_id, SUM(amount)
+FROM orders
+WHERE status = 'pending'
+  AND created_at > now() - interval '30 days'
+GROUP BY customer_id
 ORDER BY SUM(amount) DESC
 LIMIT 10;
 
--- Step 4: Observe Isolation Levels (Example Code for Sessions)
+
+-- Step 4: Observe Isolation Levels
+
 -- Session 1:
 -- BEGIN;
 -- SELECT amount FROM orders WHERE id = 1;
@@ -37,26 +58,38 @@ LIMIT 10;
 -- Session 2:
 -- UPDATE orders SET amount = 9999 WHERE id = 1;
 -- COMMIT;
-/*
--- OBSERVATION AFTER INDEX:
--- The execution plan shifts to a Bitmap Index Scan (or Index Scan) utilizing 'idx_pending_recent'.
--- Execution Time drops significantly because the partial index pre-filters only 'pending' orders and sorts them by date,
--- avoiding unnecessary disk I/O.
-*/
 
 -- Session 1 again:
 -- SELECT amount FROM orders WHERE id = 1;
 -- COMMIT;
--- Step 4: Observe Isolation Levels Notes
-/*
--- TRANSACTION ISOLATION BEHAVIOR OBSERVATIONS:
-1. Read Committed (Default):
-   - In Session 1, if we run SELECT amount WHERE id = 1, and Session 2 updates and commits a new amount (e.g., 9999),
-     running the SELECT query again in Session 1 *will* reflect the updated value (Non-Repeatable Read behavior).
-2. Repeatable Read:
-   - If Session 1 starts with 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;', it takes a snapshot of the data.
-     Even if Session 2 updates and commits the value for id = 1, Session 1 will *still* see the original old value until Session 1 commits or rolls back.
-*/
 
--- Step 5: PgBouncer Configuration Reference (/etc/pgbouncer/pgbouncer.ini)
-/*
+
+-- Repeatable Read test:
+-- Session 1:
+-- BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+-- SELECT amount FROM orders WHERE id = 1;
+
+-- Session 2:
+-- UPDATE orders SET amount = 7777 WHERE id = 1;
+-- COMMIT;
+
+-- Session 1:
+-- SELECT amount FROM orders WHERE id = 1;
+-- COMMIT;
+
+
+-- Step 5: PgBouncer Configuration
+-- PgBouncer was configured in transaction pooling mode.
+--
+-- [databases]
+-- bootcamp = host=172.29.80.1 port=5432 dbname=bootcamp
+--
+-- [pgbouncer]
+-- pool_mode = transaction
+-- max_client_conn = 1000
+-- default_pool_size = 20
+-- listen_port = 6432
+-- listen_addr = 127.0.0.1
+--
+-- PgBouncer connection was successfully tested through port 6432.
+-- PostgreSQL backend connection reported port 5432.
